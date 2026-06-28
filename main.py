@@ -1,0 +1,131 @@
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from database import Base, SessionLocal, engine, get_db
+from models import TrackedProduct, User
+from scraper import fetch_price
+
+app = FastAPI(title="Price Tracker API")
+
+scheduler = AsyncIOScheduler()
+
+
+async def check_all_prices():
+    db = SessionLocal()
+    try:
+        products = db.query(TrackedProduct).all()
+        for product in products:
+            price = await fetch_price(product.url)
+            if price is not None:
+                product.current_price = price
+                product.last_checked = datetime.now(timezone.utc)
+                if price <= product.target_price:
+                    print(
+                        f"\U0001f6a8 ALERT: Price dropped for {product.url} to {price}!"
+                    )
+        db.commit()
+    except Exception as e:
+        print(f"Error checking prices: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+    scheduler.add_job(check_all_prices, "interval", minutes=1)
+    scheduler.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    scheduler.shutdown()
+
+
+class TrackRequest(BaseModel):
+    url: str
+    user_email: str
+    target_price: float
+
+
+class ProductResponse(BaseModel):
+    id: str
+    url: str
+    target_price: float
+    current_price: float | None
+    last_checked: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+@app.post("/track")
+async def track_product(body: TrackRequest, db: Session = Depends(get_db)):
+    try:
+        user = db.query(User).filter(User.email == body.user_email).first()
+        if not user:
+            user = User(id=uuid4(), email=body.user_email)
+            db.add(user)
+            db.flush()
+
+        current_price = await fetch_price(body.url)
+
+        product = TrackedProduct(
+            id=uuid4(),
+            user_id=user.id,
+            url=body.url,
+            target_price=body.target_price,
+            current_price=current_price,
+            last_checked=datetime.now(timezone.utc) if current_price else None,
+        )
+        db.add(product)
+        db.commit()
+        db.refresh(product)
+
+        return {
+            "status": "success",
+            "data": {"product_id": str(product.id)},
+            "message": "Product tracked successfully",
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/products/{user_email}")
+def get_products(user_email: str, db: Session = Depends(get_db)):
+    try:
+        user = db.query(User).filter(User.email == user_email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        products = (
+            db.query(TrackedProduct)
+            .filter(TrackedProduct.user_id == user.id)
+            .all()
+        )
+
+        return {
+            "status": "success",
+            "data": [
+                ProductResponse(
+                    id=str(p.id),
+                    url=p.url,
+                    target_price=p.target_price,
+                    current_price=p.current_price,
+                    last_checked=p.last_checked,
+                ).model_dump()
+                for p in products
+            ],
+            "message": "Products retrieved successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
