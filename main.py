@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -6,17 +7,15 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database import Base, SessionLocal, engine, get_db
+from database import Base, engine, get_db
 from models import TrackedProduct, User
 from scraper import fetch_price
-
-app = FastAPI(title="Price Tracker API")
 
 scheduler = AsyncIOScheduler()
 
 
 async def check_all_prices():
-    db = SessionLocal()
+    db = next(get_db())
     try:
         products = db.query(TrackedProduct).all()
         for product in products:
@@ -32,20 +31,18 @@ async def check_all_prices():
     except Exception as e:
         print(f"Error checking prices: {e}")
         db.rollback()
-    finally:
-        db.close()
 
 
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     scheduler.add_job(check_all_prices, "interval", minutes=1)
     scheduler.start()
-
-
-@app.on_event("shutdown")
-def on_shutdown():
+    yield
     scheduler.shutdown()
+
+
+app = FastAPI(title="Price Tracker API", lifespan=lifespan)
 
 
 class TrackRequest(BaseModel):

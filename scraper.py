@@ -11,25 +11,32 @@ HEADERS = {
     )
 }
 
-PRICE_PATTERN = re.compile(r"[\$SAR]\s*([\d,]+\.?\d*)|([\d,]+\.?\d*)\s*(?:SAR|\$)")
+PRICE_PATTERN = re.compile(
+    r"(?:(?:SAR|USD|EUR|GBP)\s*([\d,]+\.?\d*))"
+    r"|(?:([\d,]+\.?\d*)\s*(?:SAR|USD|EUR|GBP))"
+    r"|(?:[\$£€]\s*([\d,]+\.?\d*))"
+    r"|(?:([\d,]+\.?\d*)\s*[\$£€])"
+)
 
 
-async def fetch_price(url: str) -> float | None:
-    try:
-        async with httpx.AsyncClient(
-            headers=HEADERS, timeout=15.0, follow_redirects=True
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
+async def fetch_price(url: str, max_retries: int = 2) -> float | None:
+    async with httpx.AsyncClient(
+        headers=HEADERS, timeout=15.0, follow_redirects=True
+    ) as client:
+        for attempt in range(max_retries + 1):
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "html.parser")
+                soup = BeautifulSoup(response.text, "html.parser")
 
-        text = soup.get_text(separator=" ", strip=True)
-        match = PRICE_PATTERN.search(text)
-        if match:
-            raw = (match.group(1) or match.group(2)).replace(",", "")
-            return float(raw)
+                text = soup.get_text(separator=" ", strip=True)
+                match = PRICE_PATTERN.search(text)
+                if match:
+                    raw = next(g for g in match.groups() if g is not None).replace(",", "")
+                    return float(raw)
 
-        return None
-    except (httpx.HTTPError, ValueError, TypeError):
-        return None
+                return None
+            except (httpx.HTTPError, ValueError, TypeError):
+                if attempt == max_retries:
+                    return None
