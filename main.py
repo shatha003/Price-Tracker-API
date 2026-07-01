@@ -1,13 +1,18 @@
+import ipaddress
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from uuid import uuid4
+
+from dotenv import load_dotenv
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
+from email_notifier import send_price_alert
 from models import TrackedProduct, User
 from scraper import fetch_price
 
@@ -21,12 +26,24 @@ async def check_all_prices():
         for product in products:
             price = await fetch_price(product.url)
             if price is not None:
+                if product.current_price is not None:
+                    ratio = price / product.current_price
+                    if ratio < 0.5:
+                        print(
+                            f"\u26a0\ufe0f WARNING: Price for {product.url} dropped {((1 - ratio) * 100):.0f}% "
+                            f"(from {product.current_price} to {price}). Skipping update."
+                        )
+                        continue
                 product.current_price = price
                 product.last_checked = datetime.now(timezone.utc)
                 if price <= product.target_price:
+                    user = db.query(User).filter(User.id == product.user_id).first()
+                    user_email = user.email if user else None
                     print(
                         f"\U0001f6a8 ALERT: Price dropped for {product.url} to {price}!"
                     )
+                    if user_email:
+                        send_price_alert(user_email, product.url, price, product.target_price)
         db.commit()
     except Exception as e:
         print(f"Error checking prices: {e}")
@@ -35,6 +52,7 @@ async def check_all_prices():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_dotenv()
     Base.metadata.create_all(bind=engine)
     scheduler.add_job(check_all_prices, "interval", minutes=1)
     scheduler.start()
@@ -50,6 +68,24 @@ class TrackRequest(BaseModel):
     user_email: str
     target_price: float
 
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("URL must start with http:// or https://")
+        if not parsed.netloc:
+            raise ValueError("URL must have a valid hostname")
+        try:
+            host = parsed.hostname
+            if host:
+                addr = ipaddress.ip_address(host)
+                if addr.is_private or addr.is_loopback or addr.is_link_local:
+                    raise ValueError("URL must not point to a private or local address")
+        except ValueError:
+            pass
+        return v
+
 
 class ProductResponse(BaseModel):
     id: str
@@ -60,6 +96,22 @@ class ProductResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "success",
+        "data": {
+            "title": "Price Tracker API",
+            "docs": "/docs",
+            "endpoints": {
+                "POST /track": "Track a product URL with target price",
+                "GET /products/{user_email}": "List tracked products for a user",
+            },
+        },
+        "message": "Price Tracker API is running",
+    }
 
 
 @app.post("/track")

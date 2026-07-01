@@ -1,3 +1,4 @@
+import json
 import re
 
 import httpx
@@ -19,6 +20,65 @@ PRICE_PATTERN = re.compile(
 )
 
 
+def _parse_json_ld(soup: BeautifulSoup) -> float | None:
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                offers = data.get("offers", data)
+                if isinstance(offers, dict):
+                    price = offers.get("price")
+                    if price:
+                        return float(price)
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        offers = item.get("offers", item)
+                        if isinstance(offers, dict):
+                            price = offers.get("price")
+                            if price:
+                                return float(price)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _parse_meta_tags(soup: BeautifulSoup) -> float | None:
+    for prop in ("product:price:amount", "og:price:amount"):
+        meta = soup.find("meta", property=prop)
+        if meta and meta.get("content"):
+            try:
+                return float(meta["content"].replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _parse_amazon_selectors(soup: BeautifulSoup) -> float | None:
+    selectors = [
+        ".a-price .a-offscreen",
+        ".a-price-whole",
+    ]
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            raw = el.get_text(strip=True).replace(",", "").replace("$", "").replace("SAR", "")
+            try:
+                return float(raw)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _parse_regex(soup: BeautifulSoup) -> float | None:
+    text = soup.get_text(separator=" ", strip=True)
+    match = PRICE_PATTERN.search(text)
+    if match:
+        raw = next(g for g in match.groups() if g is not None).replace(",", "")
+        return float(raw)
+    return None
+
+
 async def fetch_price(url: str, max_retries: int = 2) -> float | None:
     async with httpx.AsyncClient(
         headers=HEADERS, timeout=15.0, follow_redirects=True
@@ -30,11 +90,16 @@ async def fetch_price(url: str, max_retries: int = 2) -> float | None:
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                text = soup.get_text(separator=" ", strip=True)
-                match = PRICE_PATTERN.search(text)
-                if match:
-                    raw = next(g for g in match.groups() if g is not None).replace(",", "")
-                    return float(raw)
+                parsers = [
+                    _parse_json_ld,
+                    _parse_meta_tags,
+                    _parse_amazon_selectors,
+                    _parse_regex,
+                ]
+                for parse in parsers:
+                    price = parse(soup)
+                    if price is not None:
+                        return price
 
                 return None
             except (httpx.HTTPError, ValueError, TypeError):
